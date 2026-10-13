@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -305,6 +307,119 @@ def _request_json(url: str, payload: dict[str, Any] | None = None) -> dict[str, 
     return decoded
 
 
+def _request_streaming_chat(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.monotonic()
+    print("Waiting for Ollama; first response can take a while while the model loads...", flush=True)
+    progress_stop = threading.Event()
+
+    def report_progress() -> None:
+        while not progress_stop.wait(10):
+            elapsed = int(time.monotonic() - started)
+            print(f"Ollama is still working ({elapsed}s). Press Ctrl+C to cancel.", flush=True)
+
+    progress_thread = threading.Thread(target=report_progress, daemon=True)
+    progress_thread.start()
+    message: dict[str, Any] = {"role": "assistant", "content": ""}
+    tool_calls: dict[int, dict[str, Any]] = {}
+    streamed_content = False
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            for line in response:
+                if not line.strip():
+                    continue
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise CoderError("Ollama returned an invalid streaming JSON response.") from exc
+                if not isinstance(chunk, dict):
+                    raise CoderError("Ollama returned an unexpected streaming response.")
+                if chunk.get("error"):
+                    raise CoderError(f"Ollama error: {chunk['error']}")
+                delta = chunk.get("message", {})
+                if not isinstance(delta, dict):
+                    raise CoderError("Ollama streaming response did not contain a valid message.")
+                if isinstance(delta.get("role"), str):
+                    message["role"] = delta["role"]
+                for field in ("content", "thinking"):
+                    text = delta.get(field, "")
+                    if isinstance(text, str) and text:
+                        message[field] = message.get(field, "") + text
+                        if field == "content":
+                            progress_stop.set()
+                            progress_thread.join()
+                            if not streamed_content:
+                                print(f"\nCoder> ", end="", flush=True)
+                                streamed_content = True
+                            print(text, end="", flush=True)
+                for position, call in enumerate(delta.get("tool_calls", [])):
+                    if not isinstance(call, dict):
+                        continue
+                    index = call.get("index", position)
+                    if not isinstance(index, int):
+                        index = position
+                    current = tool_calls.setdefault(index, {"function": {}})
+                    function = call.get("function", {})
+                    if not isinstance(function, dict):
+                        continue
+                    if isinstance(function.get("name"), str):
+                        current.setdefault("function", {})["name"] = function["name"]
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, dict):
+                        current_function = current.setdefault("function", {})
+                        existing_arguments = current_function.get("arguments")
+                        if existing_arguments is None:
+                            current_function["arguments"] = arguments.copy()
+                        elif isinstance(existing_arguments, dict):
+                            existing_arguments.update(arguments)
+                        else:
+                            raise CoderError("Ollama streamed tool-call arguments in an invalid format.")
+                    elif isinstance(arguments, str):
+                        current_function = current.setdefault("function", {})
+                        existing_arguments = current_function.get("arguments")
+                        if existing_arguments is None or existing_arguments == {}:
+                            current_function["arguments"] = arguments
+                        elif isinstance(existing_arguments, str):
+                            current_function["arguments"] = existing_arguments + arguments
+                        else:
+                            raise CoderError("Ollama streamed tool-call arguments in an invalid format.")
+                if chunk.get("done"):
+                    break
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise CoderError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise CoderError(
+            f"Cannot reach Ollama at {url}. Start Ollama and check the --host value. Details: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise CoderError(f"Could not read Ollama's response: {exc}") from exc
+    finally:
+        progress_stop.set()
+        progress_thread.join()
+        if streamed_content:
+            print(flush=True)
+    for call in tool_calls.values():
+        function = call["function"]
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                function["arguments"] = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise CoderError("Ollama returned incomplete tool-call arguments.") from exc
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    elapsed = int(time.monotonic() - started)
+    if not streamed_content:
+        print(f"Ollama responded after {elapsed}s.", flush=True)
+    return message
+
+
 def _check_model(host: str, model: str) -> None:
     tags = _request_json(f"{host}/api/tags")
     installed = {entry.get("name") for entry in tags.get("models", []) if isinstance(entry, dict)}
@@ -317,13 +432,10 @@ def _check_model(host: str, model: str) -> None:
 
 def _chat_turn(host: str, model: str, messages: list[dict[str, Any]], root: Path) -> str:
     for _ in range(10):
-        response = _request_json(
+        message = _request_streaming_chat(
             f"{host}/api/chat",
-            {"model": model, "messages": messages, "tools": TOOL_DEFINITIONS, "stream": False},
+            {"model": model, "messages": messages, "tools": TOOL_DEFINITIONS, "stream": True},
         )
-        message = response.get("message")
-        if not isinstance(message, dict):
-            raise CoderError("Ollama chat response did not contain a message.")
         messages.append(message)
         tool_calls = message.get("tool_calls", [])
         if not tool_calls:
@@ -380,8 +492,8 @@ def main() -> int:
                 break
             messages.append({"role": "user", "content": prompt})
             answer = _chat_turn(host, args.model, messages, root)
-            if answer:
-                print(f"\nCoder> {answer}")
+            if not answer:
+                print("\nCoder> (No response text was returned.)")
             if prompts is not None:
                 break
         return 0

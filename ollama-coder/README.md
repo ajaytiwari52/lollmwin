@@ -23,6 +23,15 @@ The executable bundles the Coder app and its Python runtime, **not Ollama or the
 
 Requirements depend on the Ollama model. As a practical starting point, use a Windows computer with at least 16 GB of system RAM for `qwen3:8b`. Keep several gigabytes free for the model and additional disk space for its download and Ollama cache. The model is downloaded separately and is not included in this repository or executable. Larger models need more memory and disk space. Ollama can use supported GPU acceleration when available; a compatible GPU is optional.
 
+On older or CPU-only computers, `qwen3:8b` can take several minutes to answer coding requests. If it is too slow, try a smaller tool-calling model such as `qwen3:4b`:
+
+```powershell
+ollama pull qwen3:4b
+ollama-coder --model qwen3:4b
+```
+
+The CLI reports progress while waiting for Ollama and streams response text as it becomes available. Use Ctrl+C to interrupt a slow request.
+
 Check that Ollama is installed, running, and has the model:
 
 ```powershell
@@ -95,7 +104,7 @@ ollama-coder --model qwen3:8b --workspace C:\path\to\project
 
 Or replace `ollama-coder` with the path to `ollama-coder.exe`.
 
-The assistant can list and read project files, search text, propose file changes, and run commands. It omits common secret files and `.git`. It displays a diff and asks before every file write, and displays each shell command and asks before running it. Declining an approval leaves the file or command unchanged. Shell commands run in the selected project directory. Type `/exit` or press Ctrl+C to leave.
+The assistant can list and read project files, search text, propose file changes, and run commands. It omits common secret files and `.git`. It shows a progress message while Ollama loads the model or generates its first response, then streams response text as it is generated. Press Ctrl+C to interrupt a slow or unwanted response. It displays a diff and asks before every file write, and displays each shell command and asks before running it. Declining an approval leaves the file or command unchanged. Shell commands run in the selected project directory. Type `/exit` or press Ctrl+C to leave.
 
 The program never reads or prints saved Git credentials. Ask it to commit or push only when you intend to do so; it should first review the changes and ask for any missing branch or commit details. Review every proposed command and change before approving.
 
